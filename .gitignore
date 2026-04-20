@@ -30,3 +30,32 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+
+# additional ignores
+
+# Go build
+bin/
+*.exe
+*.out
+*.test
+
+# Go modules
+go.sum
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+*.env
+
+# Temporary files
+tmp/
