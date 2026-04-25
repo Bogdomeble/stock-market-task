@@ -6,12 +6,24 @@ import (
 	"stock-simulator/internal/services"
 
 	"github.com/gin-gonic/gin"
+	"fmt"
+	"net/http"
+	"time"
+	"os"
+	"context"
+	"os/signal"
+	"syscall"
+
 )
 
 func main() {
 
 	// init redis and gin
+
 	rdb := repository.NewRedisClient()
+
+	handlers.RedisClient = rdb
+
 	r := gin.Default()
 
 	// init services
@@ -38,6 +50,30 @@ func main() {
 	// Log
 	r.GET("/log", walletHandler.GetAuditLog)
 
-	r.Run(":8080")
+	srv := &http.Server{ //use built-in server instead of gin.run()
+	Addr:           ":8080",
+	Handler:        r,
+	ReadTimeout:    5 * time.Second,
+	WriteTimeout:   5 * time.Second,
+	IdleTimeout:    30 * time.Second,
+	}
+		 //sigtem handling, maybe needed maybe not?
+		 
+		go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			panic(err)
+		}
+	}()
 
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	
+	<-quit
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	if err := srv.Shutdown(ctx); err != nil {
+		fmt.Println("Server Shutdown Error:", err)
+	}
 }
