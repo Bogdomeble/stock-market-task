@@ -6,4 +6,4 @@
 
 export PORT=${1:-8080}
 
-docker-compose up --build
+sudo docker-compose up --build
