@@ -7,7 +7,7 @@ import random
 import time
 
 # Configuration
-BASE_URL = "http://localhost:8080"
+BASE_URL = "http://localhost:7070"
 STOCKS = ["AAPL", "MSFT", "GOOGL", "TSLA"]
 WALLETS = ["wallet1", "wallet2", "wallet3", "wallet4", "wallet5"]
 

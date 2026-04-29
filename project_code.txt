@@ -1,0 +1,879 @@
+PROJECT CODE DUMP
+FILES: 11
+================================================================================
+
+INDEX:
+app/Dockerfile
+app/internal/handlers/health.go
+app/internal/handlers/wallet.go
+app/internal/models/wallet.go
+app/internal/repository/redis.go
+app/internal/services/wallet_service.go
+app/main.go
+app/tests/e2e_test.go
+docker-compose.yaml
+load_test.py
+nginx/nginx.conf
+
+================================================================================
+
+FILE: app/Dockerfile
+================================================================================
+# app/Dockerfile
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN go build -o main .
+
+FROM alpine:latest
+
+# curl for healthcheck
+
+RUN apk add --no-cache curl
+
+WORKDIR /app
+
+COPY --from=builder /app/main .
+
+CMD ["./main"]
+
+FILE: app/internal/handlers/health.go
+================================================================================
+// app/internal/handlers/health.go
+package handlers
+
+import (
+	"net/http"
+	"os"
+	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+)
+
+var RedisClient *redis.Client
+
+func HealthCheck(c *gin.Context) {
+	if RedisClient == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "no redis client"})
+		return
+	}
+
+	if err := RedisClient.Ping(c).Err(); err != nil {
+    c.JSON(http.StatusOK, gin.H{
+        "status": "degraded",
+        "redis":  "down",
+    })
+			return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func Chaos(c *gin.Context) {
+	os.Exit(1)
+}
+
+FILE: app/internal/handlers/wallet.go
+================================================================================
+// app/internal/handlers/wallet.go
+package handlers
+
+import (
+	"net/http"
+	"stock-simulator/internal/services"
+
+	"github.com/gin-gonic/gin"
+)
+
+type WalletHandler struct {
+	service *services.WalletService
+}
+
+func NewWalletHandler(s *services.WalletService) *WalletHandler {
+	return &WalletHandler{service: s}
+}
+
+type StockDTO struct {
+	Name     string `json:"name"`
+	Quantity int    `json:"quantity"`
+}
+
+func (h *WalletHandler) HandleStockOperation(c *gin.Context) {
+	walletID := c.Param("wallet_id")
+	stockName := c.Param("stock_name")
+
+	var body struct {
+		Type string `json:"type"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	var err error
+	if body.Type == "buy" {
+		err = h.service.Buy(walletID, stockName)
+	} else if body.Type == "sell" {
+		err = h.service.Sell(walletID, stockName)
+	} else {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid type"})
+		return
+	}
+
+	if err != nil {
+		if err.Error() == "NOT_FOUND" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "stock not found in bank"})
+			return
+		}
+		if err.Error() == "INSUFFICIENT_FUNDS" || err.Error() == "NO_STOCK_IN_WALLET" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "insufficient stocks"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.Status(http.StatusOK)
+}
+
+func (h *WalletHandler) GetWallet(c *gin.Context) {
+	walletID := c.Param("wallet_id")
+	stocksMap, err := h.service.GetWallet(walletID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	stocks := []StockDTO{} // empty slice instead of nil
+	for name, qty := range stocksMap {
+		stocks = append(stocks, StockDTO{Name: name, Quantity: qty})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"id": walletID, "stocks": stocks})
+}
+
+func (h *WalletHandler) GetWalletStockQuantity(c *gin.Context) {
+	walletID := c.Param("wallet_id")
+	stockName := c.Param("stock_name")
+
+	qty, err := h.service.GetWalletStock(walletID, stockName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// returns a single number, like: 99
+	c.JSON(http.StatusOK, qty)
+}
+
+func (h *WalletHandler) GetBankState(c *gin.Context) {
+	stocksMap, err := h.service.GetBankState()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	stocks := []StockDTO{}
+	for name, qty := range stocksMap {
+		stocks = append(stocks, StockDTO{Name: name, Quantity: qty})
+	}
+	c.JSON(http.StatusOK, gin.H{"stocks": stocks})
+}
+
+func (h *WalletHandler) SetBankState(c *gin.Context) {
+	var body struct {
+		Stocks []StockDTO `json:"stocks"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	stocksMap := make(map[string]int)
+	for _, s := range body.Stocks {
+		stocksMap[s.Name] = s.Quantity
+	}
+
+	if err := h.service.SetBankState(stocksMap); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.Status(http.StatusOK)
+}
+
+func (h *WalletHandler) GetAuditLog(c *gin.Context) {
+	logs, err := h.service.GetLog()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"log": logs})
+}
+
+
+FILE: app/internal/models/wallet.go
+================================================================================
+// app/internal/models/wallet.go
+package models
+
+type Wallet struct {
+	ID     string         `json:"id"`
+	Stocks map[string]int `json:"stocks"`
+}
+
+FILE: app/internal/repository/redis.go
+================================================================================
+// app/internal/repository/redis.go
+package repository
+
+import (
+	"context"
+	"os"
+
+	"github.com/redis/go-redis/v9"
+)
+
+var Ctx = context.Background()
+
+func NewRedisClient() *redis.Client {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		addr = "localhost:6379"
+	}
+
+	return redis.NewClient(&redis.Options{
+		Addr: addr,
+	})
+}
+
+FILE: app/internal/services/wallet_service.go
+================================================================================
+// app/internal/services/wallet_service.go
+package services
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/redis/go-redis/v9"
+)
+
+type WalletService struct {
+	rdb *redis.Client
+}
+
+func NewWalletService(rdb *redis.Client) *WalletService { //constructor
+	return &WalletService{rdb: rdb}
+}
+
+const (
+	bankKey = "bank_stocks"
+	logKey  = "audit_log"
+)
+
+var buyScript = redis.NewScript(`
+
+		local bank_qty = redis.call("HGET", KEYS[1], ARGV[1])
+		if not bank_qty then return -1 end
+		if tonumber(bank_qty) <= 0 then return -2 end
+
+		redis.call("HINCRBY", KEYS[1], ARGV[1], -1)
+		redis.call("HINCRBY", KEYS[2], ARGV[1], 1)
+		return 1
+
+	`)
+
+var sellScript = redis.NewScript(`
+	local bank_exists = redis.call("HEXISTS", KEYS[2], ARGV[1])
+	if bank_exists == 0 then return -1 end
+
+	local wallet_qty = redis.call("HGET", KEYS[1], ARGV[1])
+	if not wallet_qty or tonumber(wallet_qty) <= 0 then return -2 end
+
+	redis.call("HINCRBY", KEYS[1], ARGV[1], -1)
+	redis.call("HINCRBY", KEYS[2], ARGV[1], 1)
+	return 1
+`)
+
+func (s *WalletService) Buy(walletID, stockName string) error {
+	ctx := context.Background()
+	walletKey := fmt.Sprintf("wallet:%s", walletID)
+
+	res, err := buyScript.Run(ctx, s.rdb, []string{bankKey, walletKey}, stockName).Int()
+	if err != nil {
+		return err
+	}
+
+	if res == -1 {
+		return fmt.Errorf("NOT_FOUND")
+	}
+	if res == -2 {
+		return fmt.Errorf("INSUFFICIENT_FUNDS")
+	}
+
+	s.logAction("buy", walletID, stockName)
+	return nil
+}
+
+func (s *WalletService) Sell(walletID, stockName string) error {
+	ctx := context.Background()
+	walletKey := fmt.Sprintf("wallet:%s", walletID)
+
+	res, err := sellScript.Run(ctx, s.rdb, []string{walletKey, bankKey}, stockName).Int()
+	if err != nil {
+		return err
+	}
+
+	if res == -1 {
+		return fmt.Errorf("NOT_FOUND")
+	}
+	if res == -2 {
+		return fmt.Errorf("NO_STOCK_IN_WALLET")
+	}
+
+	s.logAction("sell", walletID, stockName)
+	return nil
+}
+
+func (s *WalletService) logAction(opType, walletID, stockName string) {
+	entry, _ := json.Marshal(map[string]string{
+		"type":       opType,
+		"wallet_id":  walletID,
+		"stock_name": stockName,
+	})
+
+	ctx := context.Background()
+	s.rdb.RPush(ctx, logKey, entry)
+	// no more that 10k log entries
+	s.rdb.LTrim(ctx, logKey, -10000, -1)
+}
+
+func (s *WalletService) GetWallet(walletID string) (map[string]int, error) {
+	res, err := s.rdb.HGetAll(context.Background(), "wallet:"+walletID).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	stocks := make(map[string]int)
+	for k, v := range res {
+		var qty int
+		fmt.Sscanf(v, "%d", &qty)
+		if qty > 0 { // do not include stock that have 0 counts on a wallet
+			stocks[k] = qty
+		}
+	}
+	return stocks, nil
+}
+
+func (s *WalletService) GetWalletStock(walletID, stockName string) (int, error) {
+	res, err := s.rdb.HGet(context.Background(), "wallet:"+walletID, stockName).Int()
+
+	if err == redis.Nil {
+		return 0, nil
+	}
+
+	return res, err
+}
+
+func (s *WalletService) GetBankState() (map[string]int, error) {
+	res, err := s.rdb.HGetAll(context.Background(), bankKey).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	stocks := make(map[string]int)
+	for k, v := range res {
+		var qty int
+		fmt.Sscanf(v, "%d", &qty)
+		stocks[k] = qty
+	}
+	return stocks, nil
+}
+
+func (s *WalletService) SetBankState(stocks map[string]int) error {
+	ctx := context.Background()
+	pipe := s.rdb.TxPipeline()
+	pipe.Del(ctx, bankKey) // "sets the state" - czyszczenie starego stanu
+
+	if len(stocks) > 0 {
+		var args []interface{}
+		for k, v := range stocks {
+			args = append(args, k, v)
+		}
+		pipe.HSet(ctx, bankKey, args...)
+	}
+
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func (s *WalletService) GetLog() ([]map[string]string, error) {
+	res, err := s.rdb.LRange(context.Background(), logKey, 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var logs []map[string]string
+	for _, item := range res {
+		var entry map[string]string
+		json.Unmarshal([]byte(item), &entry)
+		logs = append(logs, entry)
+	}
+	if logs == nil {
+		logs = []map[string]string{}
+	}
+	return logs, nil
+}
+
+
+FILE: app/main.go
+================================================================================
+// app/main.go
+package main
+
+import (
+	"stock-simulator/internal/handlers"
+	"stock-simulator/internal/repository"
+	"stock-simulator/internal/services"
+
+	"github.com/gin-gonic/gin"
+	"fmt"
+	"net/http"
+	"time"
+	"os"
+	"context"
+	"os/signal"
+	"syscall"
+
+)
+
+func main() {
+
+	// init redis and gin
+
+	rdb := repository.NewRedisClient()
+
+	handlers.RedisClient = rdb
+
+	r := gin.Default()
+
+	// init services
+	walletService := services.NewWalletService(rdb)
+
+	// init handlers
+	walletHandler := handlers.NewWalletHandler(walletService)
+
+	// routes
+	// health and chaos
+
+	r.GET("/health", handlers.HealthCheck)
+	r.POST("/chaos", handlers.Chaos)
+
+	// wallets
+	r.POST("/wallets/:wallet_id/stocks/:stock_name", walletHandler.HandleStockOperation)
+	r.GET("/wallets/:wallet_id", walletHandler.GetWallet)
+	r.GET("/wallets/:wallet_id/stocks/:stock_name", walletHandler.GetWalletStockQuantity)
+
+	// Bank
+	r.GET("/stocks", walletHandler.GetBankState)
+	r.POST("/stocks", walletHandler.SetBankState)
+
+	// Log
+	r.GET("/log", walletHandler.GetAuditLog)
+
+	srv := &http.Server{ //use built-in server instead of gin.run()
+	Addr:           ":8080",
+	Handler:        r,
+	ReadTimeout:    5 * time.Second,
+	WriteTimeout:   5 * time.Second,
+	IdleTimeout:    30 * time.Second,
+	}
+		 //sigtem handling, maybe needed maybe not?
+		 
+		go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			panic(err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	
+	<-quit
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	if err := srv.Shutdown(ctx); err != nil {
+		fmt.Println("Server Shutdown Error:", err)
+	}
+}
+
+
+FILE: app/tests/e2e_test.go
+================================================================================
+// app/tests/e2e_test.go
+// app/e2e_test.go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"stock-simulator/internal/handlers"
+	"stock-simulator/internal/services"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
+)
+
+// setupRouter configuration Miniredis + Gin + Handlery
+func setupRouter() (*gin.Engine, *miniredis.Miniredis) {
+	gin.SetMode(gin.TestMode)
+
+	// create redis db in ram
+	mr, _ := miniredis.Run()
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+
+	walletService := services.NewWalletService(rdb)
+	walletHandler := handlers.NewWalletHandler(walletService)
+
+	r := gin.Default()
+	r.POST("/stocks", walletHandler.SetBankState)
+	r.POST("/wallets/:wallet_id/stocks/:stock_name", walletHandler.HandleStockOperation)
+	r.GET("/wallets/:wallet_id", walletHandler.GetWallet)
+
+	return r, mr
+}
+
+func TestStockMarketFlow(t *testing.T) {
+	r, mr := setupRouter()
+	defer mr.Close()
+
+	// 1 - add stocks to back
+	t.Run("Set Bank State", func(t *testing.T) {
+		body := `{"stocks": [{"name":"AAPL", "quantity":1}]}`
+		req, _ := http.NewRequest("POST", "/stocks", bytes.NewBufferString(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+	})
+
+	// 2 - buy stocks from back
+	t.Run("Buy Stock - Success", func(t *testing.T) {
+		body := `{"type":"buy"}`
+		req, _ := http.NewRequest("POST", "/wallets/w1/stocks/AAPL", bytes.NewBufferString(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+	})
+
+	// 3 - buy stock without money - 400
+	t.Run("Buy Stock - Insufficient Funds (400)", func(t *testing.T) {
+		body := `{"type":"buy"}`
+		req, _ := http.NewRequest("POST", "/wallets/w2/stocks/AAPL", bytes.NewBufferString(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
+	// 4 - unknown stock - 404
+	t.Run("Buy Stock - Not Found (404)", func(t *testing.T) {
+		body := `{"type":"buy"}`
+		req, _ := http.NewRequest("POST", "/wallets/w1/stocks/MSFT", bytes.NewBufferString(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+
+	// sell proper stock - 200
+	t.Run("Sell Stock - Success", func(t *testing.T) {
+		body := `{"type":"sell"}`
+		req, _ := http.NewRequest("POST", "/wallets/w1/stocks/AAPL", bytes.NewBufferString(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+	})
+
+	// 6 - sell stock with empty wallet - 400
+	t.Run("Sell Stock - Empty Wallet (400)", func(t *testing.T) {
+		body := `{"type":"sell"}`
+		req, _ := http.NewRequest("POST", "/wallets/w1/stocks/AAPL", bytes.NewBufferString(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
+	// 7 - check wallet status (should be empty here)
+	t.Run("Check Wallet", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/wallets/w1", nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+
+		// Wymagane sprawdzanie tablicy akcji wg wytycznych z zadania
+		stocks := resp["stocks"].([]interface{})
+		assert.Equal(t, 0, len(stocks))
+	})
+}
+
+
+FILE: docker-compose.yaml
+================================================================================
+# docker-compose.yaml
+services:
+    nginx:
+        image: nginx:latest
+
+        ports:
+            - "${PORT}:80"
+
+        volumes:
+            - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+
+        depends_on:
+            app1:
+                condition: service_healthy
+            app2:
+                condition: service_healthy
+
+    app1:
+        build: ./app
+
+        environment:
+            - REDIS_ADDR=redis:6379
+
+        depends_on:
+            - redis
+
+        restart: always
+
+        healthcheck:
+            test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+
+            interval: 5s
+
+            timeout: 2s
+
+            retries: 3
+
+    app2:
+        build: ./app
+
+        environment:
+            - REDIS_ADDR=redis:6379
+
+        depends_on:
+            - redis
+
+        restart: always
+
+        healthcheck:
+            test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+
+            interval: 5s
+
+            timeout: 2s
+
+            retries: 3
+
+            start_period: 10s
+
+    redis:
+        image: redis:7-alpine
+
+
+FILE: load_test.py
+================================================================================
+# load_test.py
+import urllib.request
+import urllib.error
+import json
+import concurrent.futures
+import threading
+import random
+import time
+
+# Configuration
+BASE_URL = "http://localhost:8080"
+STOCKS = ["AAPL", "MSFT", "GOOGL", "TSLA"]
+WALLETS = ["wallet1", "wallet2", "wallet3", "wallet4", "wallet5"]
+
+THREADS = 100
+REQUESTS_PER_THREAD = 100
+CHAOS_DELAY = 1.5
+
+
+def do_request(method, path, data=None):
+    url = BASE_URL + path
+    headers = {'Content-Type': 'application/json'}
+    body = json.dumps(data).encode('utf-8') if data else None
+
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except urllib.error.URLError as e:
+        return 0, str(e.reason)
+
+
+def setup_bank():
+    print("Step 1: Initializing bank state (loading stocks)")
+
+    payload = {
+        "stocks": [{"name": s, "quantity": 10000} for s in STOCKS]
+    }
+
+    status, _ = do_request("POST", "/stocks", payload)
+
+    if status == 200:
+        print("Bank initialized successfully (10,000 units per stock).")
+    else:
+        print(f"Failed to initialize bank. Status: {status}")
+
+
+def trigger_chaos(delay):
+    time.sleep(delay)
+
+    print(f"\n[CHAOS TEST] Triggering failure via {BASE_URL}/chaos")
+
+    status, _ = do_request("POST", "/chaos")
+
+    print(f"[CHAOS TEST] Chaos triggered. Response status: {status}\n")
+
+
+def worker(worker_id):
+    success = 0
+    client_errors = 0
+    server_errors = 0
+
+    for _ in range(REQUESTS_PER_THREAD):
+        wallet = random.choice(WALLETS)
+        stock = random.choice(STOCKS)
+        action = random.choice(["buy", "sell"])
+
+        status, _ = do_request(
+            "POST",
+            f"/wallets/{wallet}/stocks/{stock}",
+            {"type": action}
+        )
+
+        if status == 200:
+            success += 1
+        elif status in (400, 404):
+            client_errors += 1
+        else:
+            server_errors += 1
+
+    return success, client_errors, server_errors
+
+
+def run_load_test():
+    print("\nStep 2: Starting load test")
+    print(f"Threads: {THREADS}, Requests per thread: {REQUESTS_PER_THREAD}")
+    print(f"Total requests: {THREADS * REQUESTS_PER_THREAD}")
+
+    start_time = time.time()
+
+    total_success = 0
+    total_client_errors = 0
+    total_server_errors = 0
+
+    chaos_thread = threading.Thread(target=trigger_chaos, args=(CHAOS_DELAY,))
+    chaos_thread.start()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
+        futures = [executor.submit(worker, i) for i in range(THREADS)]
+
+        for future in concurrent.futures.as_completed(futures):
+            s, c_err, s_err = future.result()
+            total_success += s
+            total_client_errors += c_err
+            total_server_errors += s_err
+
+    duration = time.time() - start_time
+
+    print("\nTest completed")
+    print(f"Duration: {duration:.2f} seconds")
+    print(f"Successful requests (200): {total_success}")
+    print(f"Client errors (400/404): {total_client_errors}")
+    print(f"Server errors (500/502/503): {total_server_errors}")
+    print(f"Throughput: {(THREADS * REQUESTS_PER_THREAD) / duration:.2f} req/s")
+
+
+def fetch_logs():
+    print("\nStep 3: Fetching audit logs")
+
+    time.sleep(1)
+
+    status, body = do_request("GET", "/log")
+
+    if status == 200:
+        data = json.loads(body)
+        logs = data.get("log", [])
+
+        print(f"Retrieved {len(logs)} audit log entries")
+
+        with open("audit_logs.json", "w", encoding="utf-8") as f:
+            json.dump(logs, f, indent=4)
+
+        print("Audit logs saved to audit_logs.json")
+    else:
+        print(f"Failed to fetch logs. Status: {status}")
+
+
+if __name__ == "__main__":
+    setup_bank()
+    run_load_test()
+    fetch_logs()
+
+FILE: nginx/nginx.conf
+================================================================================
+# nginx/nginx.conf
+events {}
+
+http {
+  upstream backend {
+    server app1:8080 max_fails=3 fail_timeout=10s;
+    server app2:8080 max_fails=3 fail_timeout=10s;
+  }
+
+  server {
+    listen 80;
+
+    location / {
+      proxy_pass http://backend;
+
+      proxy_next_upstream error timeout http_500 http_502 http_503 http_504;
+      
+    }
+  }
+}

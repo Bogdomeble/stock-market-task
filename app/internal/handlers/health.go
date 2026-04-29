@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"time"
 	"os"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -27,5 +28,13 @@ func HealthCheck(c *gin.Context) {
 }
 
 func Chaos(c *gin.Context) {
+	// we send request with 200 code to let nginx know that operation succeded
+
+	c.JSON(http.StatusOK, gin.H{"message": "chaos initiated"})
+    go func() {
+        time.Sleep(100 * time.Millisecond) // maybe not needed
+        os.Exit(1)
+    }()
+
 	os.Exit(1)
 }

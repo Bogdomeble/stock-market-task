@@ -40,8 +40,8 @@ bin/
 *.out
 *.test
 
-# Go modules
-go.sum
+# Go modules (for running it after cloning repo i will comment this out)
+# go.sum
 
 # Logs
 *.log
