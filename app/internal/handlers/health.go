@@ -32,7 +32,7 @@ func Chaos(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "chaos initiated"})
     go func() {
-        time.Sleep(100 * time.Millisecond) // maybe not needed
+        time.Sleep(100 * time.Millisecond) // maybe not needed, slows down the requests per minute metric
         os.Exit(1)
     }()
 
