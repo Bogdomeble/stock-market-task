@@ -1,9 +1,11 @@
+
 #!/bin/bash
+# for linux and macos
 
-#
-# run.sh - alternative to the docker compose approach
-#
+if [ -z "$1" ]; then
+    echo "Usage: ./run.sh <PORT>"
+    exit 1
+fi
 
-export PORT=${1:-8080}
-
-sudo docker-compose up --build
+export PORT=$1
+docker compose up -d --build

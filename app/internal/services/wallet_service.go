@@ -3,16 +3,25 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/redis/go-redis/v9"
+)
+
+// variables for error handling
+var (
+	ErrStockNotFound     = errors.New("NOT_FOUND")
+	ErrInsufficientFunds = errors.New("INSUFFICIENT_FUNDS")
+	ErrNoStockInWallet   = errors.New("NO_STOCK_IN_WALLET")
+	ErrWalletNotFound    = errors.New("WALLET_NOT_FOUND")
 )
 
 type WalletService struct {
 	rdb *redis.Client
 }
 
-func NewWalletService(rdb *redis.Client) *WalletService { //constructor
+func NewWalletService(rdb *redis.Client) *WalletService { // constructor
 	return &WalletService{rdb: rdb}
 }
 
@@ -22,16 +31,14 @@ const (
 )
 
 var buyScript = redis.NewScript(`
+	local bank_qty = redis.call("HGET", KEYS[1], ARGV[1])
+	if not bank_qty then return -1 end
+	if tonumber(bank_qty) <= 0 then return -2 end
 
-		local bank_qty = redis.call("HGET", KEYS[1], ARGV[1])
-		if not bank_qty then return -1 end
-		if tonumber(bank_qty) <= 0 then return -2 end
-
-		redis.call("HINCRBY", KEYS[1], ARGV[1], -1)
-		redis.call("HINCRBY", KEYS[2], ARGV[1], 1)
-		return 1
-
-	`)
+	redis.call("HINCRBY", KEYS[1], ARGV[1], -1)
+	redis.call("HINCRBY", KEYS[2], ARGV[1], 1)
+	return 1
+`)
 
 var sellScript = redis.NewScript(`
 	local bank_exists = redis.call("HEXISTS", KEYS[2], ARGV[1])
@@ -49,16 +56,16 @@ func (s *WalletService) Buy(walletID, stockName string) error {
 	ctx := context.Background()
 	walletKey := fmt.Sprintf("wallet:%s", walletID)
 
-	res, err := buyScript.Run(ctx, s.rdb, []string{bankKey, walletKey}, stockName).Int()
+	res, err := buyScript.Run(ctx, s.rdb,[]string{bankKey, walletKey}, stockName).Int()
 	if err != nil {
 		return err
 	}
 
 	if res == -1 {
-		return fmt.Errorf("NOT_FOUND")
+		return ErrStockNotFound
 	}
 	if res == -2 {
-		return fmt.Errorf("INSUFFICIENT_FUNDS")
+		return ErrInsufficientFunds
 	}
 
 	s.logAction("buy", walletID, stockName)
@@ -69,16 +76,16 @@ func (s *WalletService) Sell(walletID, stockName string) error {
 	ctx := context.Background()
 	walletKey := fmt.Sprintf("wallet:%s", walletID)
 
-	res, err := sellScript.Run(ctx, s.rdb, []string{walletKey, bankKey}, stockName).Int()
+	res, err := sellScript.Run(ctx, s.rdb,[]string{walletKey, bankKey}, stockName).Int()
 	if err != nil {
 		return err
 	}
 
 	if res == -1 {
-		return fmt.Errorf("NOT_FOUND")
+		return ErrStockNotFound
 	}
 	if res == -2 {
-		return fmt.Errorf("NO_STOCK_IN_WALLET")
+		return ErrNoStockInWallet
 	}
 
 	s.logAction("sell", walletID, stockName)
@@ -94,12 +101,23 @@ func (s *WalletService) logAction(opType, walletID, stockName string) {
 
 	ctx := context.Background()
 	s.rdb.RPush(ctx, logKey, entry)
-	// no more that 10k log entries
+	// no more than 10k log entries
 	s.rdb.LTrim(ctx, logKey, -10000, -1)
 }
 
 func (s *WalletService) GetWallet(walletID string) (map[string]int, error) {
-	res, err := s.rdb.HGetAll(context.Background(), "wallet:"+walletID).Result()
+	key := "wallet:" + walletID
+
+	// check if the wallet exists for the given walletID
+	exists, err := s.rdb.Exists(context.Background(), key).Result()
+	if err != nil {
+		return nil, err
+	}
+	if exists == 0 {
+		return nil, ErrWalletNotFound
+	}
+
+	res, err := s.rdb.HGetAll(context.Background(), key).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -143,10 +161,10 @@ func (s *WalletService) GetBankState() (map[string]int, error) {
 func (s *WalletService) SetBankState(stocks map[string]int) error {
 	ctx := context.Background()
 	pipe := s.rdb.TxPipeline()
-	pipe.Del(ctx, bankKey) // "sets the state" - czyszczenie starego stanu
+	pipe.Del(ctx, bankKey) // clear old state
 
 	if len(stocks) > 0 {
-		var args []interface{}
+		var args[]interface{}
 		for k, v := range stocks {
 			args = append(args, k, v)
 		}
@@ -170,7 +188,7 @@ func (s *WalletService) GetLog() ([]map[string]string, error) {
 		logs = append(logs, entry)
 	}
 	if logs == nil {
-		logs = []map[string]string{}
+		logs =[]map[string]string{}
 	}
 	return logs, nil
 }

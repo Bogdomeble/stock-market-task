@@ -3,6 +3,7 @@ package handlers
 import (
 	"net/http"
 	"stock-simulator/internal/services"
+	"errors"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,30 +26,28 @@ func (h *WalletHandler) HandleStockOperation(c *gin.Context) {
 	stockName := c.Param("stock_name")
 
 	var body struct {
-		Type string `json:"type"`
+		Type string `json:"type" binding:"required,oneof=buy sell"`
 	}
 
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid action type, must be 'buy' or 'sell'"})
 		return
 	}
 
 	var err error
 	if body.Type == "buy" {
 		err = h.service.Buy(walletID, stockName)
-	} else if body.Type == "sell" {
-		err = h.service.Sell(walletID, stockName)
 	} else {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid type"})
-		return
-	}
+			err = h.service.Sell(walletID,stockName)
+		}
+
 
 	if err != nil {
-		if err.Error() == "NOT_FOUND" {
+		if errors.Is(err, services.ErrStockNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "stock not found in bank"})
 			return
 		}
-		if err.Error() == "INSUFFICIENT_FUNDS" || err.Error() == "NO_STOCK_IN_WALLET" {
+		if errors.Is(err, services.ErrInsufficientFunds) || errors.Is(err, services.ErrNoStockInWallet) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "insufficient stocks"})
 			return
 		}
@@ -63,6 +62,10 @@ func (h *WalletHandler) GetWallet(c *gin.Context) {
 	walletID := c.Param("wallet_id")
 	stocksMap, err := h.service.GetWallet(walletID)
 	if err != nil {
+		if errors.Is(err, services.ErrWalletNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "wallet not found"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
