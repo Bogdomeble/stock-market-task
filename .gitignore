@@ -17,6 +17,9 @@ coverage.*
 *.coverprofile
 profile.cov
 
+# logs
+audit_logs.json
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
@@ -63,3 +66,4 @@ tmp/
 #other files
 merge.py
 project_code.txt
+
